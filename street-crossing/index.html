@@ -203,7 +203,7 @@
     // Spawn
     for (const l in LANES) {
       spawnTimers[l] -= dt;
-      if (spawnTimers[l] <= 0) { cars.push(makeCar(+l)); spawnTimers[l] = 1.3 + Math.random() * 1.8; }
+      if (spawnTimers[l] <= 0) { cars.push(makeCar(+l)); spawnTimers[l] = 2.0 + Math.random() * 1.8; }
     }
     // Move cars and update sound
     const ct = ctx.currentTime;
