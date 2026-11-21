@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rooftop Run</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee; margin:0; padding:1.5rem; line-height:1.5; }
+  main { max-width: 40rem; margin: 0 auto; }
+  #game { border:2px solid #555; border-radius:8px; padding:1rem; margin:1rem 0; outline:none; }
+  #game:focus { border-color:#6cf; }
+  .row { display:flex; justify-content:space-between; font-size:1.2rem; padding:.2rem 0; }
+  #map { font-family: monospace; font-size:1.1rem; white-space:pre; margin-top:.5rem; }
+  .sr { position:absolute; left:-9999px; width:1px; height:1px; overflow:hidden; }
+  kbd { background:#333; border-radius:3px; padding:0 .3rem; }
+  a { color:#6cf; }
+</style>
+</head>
+<body>
+<main>
+<p><a href="../">Back to Audio Worlds</a></p>
+<h1>Rooftop Run</h1>
+<div id="game" role="application" tabindex="0" aria-label="Rooftop Run">
+  <div aria-hidden="true">
+    <div class="row"><span>Status</span><span id="hStatus">Press Enter to start</span></div>
+    <div class="row"><span>Where</span><span id="hWhere">-</span></div>
+    <div class="row"><span>Time left</span><span id="hTime">90</span></div>
+    <div class="row"><span>Deaths</span><span id="hDeaths">0</span></div>
+    <div class="row"><span>Best</span><span id="hBest">-</span></div>
+    <div id="map"></div>
+  </div>
+</div>
+<div id="say" class="sr" aria-live="assertive" aria-atomic="true"></div>
+
+<h2>How to play</h2>
+<p>Get from the ground floor of the first building to the roof of the fourth building in 90 seconds. If you die, you go back to the start, but the clock keeps running.</p>
+<ol>
+  <li><strong>The hallway.</strong> Walk right toward the ladder. Gunmen stand in doorways along the way. Each gunman's shot only covers the spot right in front of him, so don't be standing there when he fires.</li>
+  <li><strong>The ladder.</strong> When you reach it, climb with three presses of the up arrow. You can't walk left or right while you're on the ladder.</li>
+  <li><strong>The roof.</strong> A helicopter flies back and forth over the roof. Jump as it comes over you, then grab it. It carries you to the roof of the next building. Bombs fall now and then, so step out of the way.</li>
+</ol>
+<h2>Keys</h2>
+<ul>
+  <li><kbd>Left arrow</kbd> and <kbd>Right arrow</kbd>: walk. Tap for one step, or hold to keep walking.</li>
+  <li><kbd>Up arrow</kbd>: climb the ladder. <kbd>Down arrow</kbd>: climb back down.</li>
+  <li><kbd>Space</kbd>: jump. <kbd>F</kbd>: grab the helicopter while you're in the air.</li>
+  <li><kbd>P</kbd>: where you are. <kbd>T</kbd>: time left. <kbd>Enter</kbd>: start or restart.</li>
+</ul>
+<h2>Sounds</h2>
+<ul>
+  <li>Everything is placed left or right of you, so a sound in your right ear is ahead of you.</li>
+  <li><strong>Gunmen:</strong> a click and a rising whine mean a gunman is about to fire. A whine in the center means he's aiming right at you, so move.</li>
+  <li><strong>Ladder:</strong> it gives off a soft metal ping so you can find it.</li>
+  <li><strong>Helicopter:</strong> it gets louder and brighter as it gets close, and it's directly over you when it's in the center and loudest.</li>
+  <li><strong>Bombs:</strong> a falling whistle that drops in pitch, placed where the bomb will land. The blast also covers one step on each side of that spot.</li>
+</ul>
+</main>
+
+<script>
+(() => {
+  const GAME_TIME = 90, HALL = 24, ROOF = 12, STEP_MS = 220;
+  const GUN_SPOTS = [4, 8, 12, 16, 20];
+  const JUMP_TIME = 0.7, GRAB_RANGE = 0.9, BLAST_RADIUS = 1, RIDE_TIME = 2.5;
+
+  const game = document.getElementById('game');
+  const sayEl = document.getElementById('say');
+  const h = id => document.getElementById(id);
+  let flip = false;
+  const say = t => { flip = !flip; sayEl.textContent = t + (flip ? ' ' : ''); };
+
+  let best = null;
+  try { const b = localStorage.getItem('rooftopRunBest'); if (b) best = +b; } catch (e) {}
+  const showBest = () => h('hBest').textContent = best ? best.toFixed(1) + ' s' : '-';
+  showBest();
+
+  // ---------- Audio ----------
+  let ctx, master, noiseBuf, heli = null;
+  function initAudio() {
+    if (ctx) { if (ctx.state === 'suspended') ctx.resume(); return; }
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    master = ctx.createGain(); master.gain.value = 0.8; master.connect(ctx.destination);
+    noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    buildHeli();
+  }
+  const clampPan = dx => Math.max(-1, Math.min(1, dx / 6));
+  const distGain = dx => 1 / (1 + Math.abs(dx) * 0.35);
+  function out(pan) {
+    const p = ctx.createStereoPanner(); p.pan.value = pan; p.connect(master); return p;
+  }
+  function tone(freq, type, dur, vol, { delay = 0, endFreq = null, pan = 0, lp = null } = {}) {
+    const t = ctx.currentTime + delay;
+    const o = ctx.createOscillator(); o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (endFreq) o.frequency.exponentialRampToValueAtTime(endFreq, t + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    let n = o;
+    if (lp) { const f = ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = lp; o.connect(f); n = f; }
+    n.connect(g).connect(out(pan)); o.start(t); o.stop(t + dur + 0.05);
+  }
+  function noise(dur, vol, type, freq, { q = 1, delay = 0, pan = 0 } = {}) {
+    const t = ctx.currentTime + delay;
+    const s = ctx.createBufferSource(); s.buffer = noiseBuf;
+    const f = ctx.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
+    const g = ctx.createGain(); g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f).connect(g).connect(out(pan)); s.start(t); s.stop(t + dur + 0.05);
+  }
+  const sfx = {
+    step() { noise(0.05, 0.25, 'bandpass', 900, { q: 1.5 }); },
+    roofStep() { noise(0.06, 0.25, 'lowpass', 700); },
+    bump() { tone(110, 'sine', 0.1, 0.2); },
+    rung() { tone(520, 'triangle', 0.12, 0.2); tone(1040, 'sine', 0.2, 0.05); },
+    ladderPing(dx) { tone(1568, 'sine', 0.15, 0.12 * distGain(dx), { pan: clampPan(dx) }); },
+    ladderHere() { tone(784, 'triangle', 0.1, 0.2); tone(1175, 'triangle', 0.15, 0.2, { delay: 0.1 }); },
+    gunWarn(dx) {
+      const v = 0.3 * distGain(dx), p = clampPan(dx);
+      noise(0.03, v * 1.5, 'highpass', 3000, { pan: p });
+      noise(0.03, v * 1.5, 'highpass', 2500, { pan: p, delay: 0.09 });
+      tone(300, 'square', 0.9, v * 0.6, { endFreq: 700, pan: p, lp: 1800, delay: 0.1 });
+    },
+    bang(dx) {
+      const v = 0.9 * distGain(dx), p = clampPan(dx);
+      noise(0.25, v, 'highpass', 900, { pan: p }); tone(90, 'sine', 0.2, v * 0.8, { endFreq: 40, pan: p });
+    },
+    jump() { noise(0.25, 0.2, 'bandpass', 1200, { q: 0.8 }); tone(300, 'sine', 0.25, 0.1, { endFreq: 600 }); },
+    land() { noise(0.12, 0.35, 'lowpass', 300); },
+    grab() { tone(880, 'triangle', 0.1, 0.25); tone(1320, 'triangle', 0.2, 0.25, { delay: 0.08 }); },
+    whistle(dx, dur) { tone(1800, 'sine', dur, 0.25 * distGain(dx), { endFreq: 450, pan: clampPan(dx) }); },
+    boom(dx) {
+      const v = 1 * distGain(dx), p = clampPan(dx);
+      noise(1.2, v, 'lowpass', 700, { pan: p }); tone(55, 'sine', 0.8, v * 0.7, { endFreq: 30, pan: p });
+    },
+    die() { tone(500, 'sawtooth', 0.8, 0.15, { endFreq: 80, lp: 1500, delay: 0.25 }); },
+    arrive() { [523, 784, 1047].forEach((f, i) => tone(f, 'triangle', 0.18, 0.2, { delay: i * 0.1 })); },
+    win() { [523, 659, 784, 1047, 784, 1047].forEach((f, i) => tone(f, 'triangle', 0.22, 0.22, { delay: i * 0.13 })); },
+    timeout() { [392, 330, 262].forEach((f, i) => tone(f, 'square', 0.3, 0.12, { delay: i * 0.3, lp: 2000 })); }
+  };
+
+  function buildHeli() {
+    const src = ctx.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+    const bp = ctx.createBiquadFilter(); bp.type = 'lowpass'; bp.frequency.value = 600;
+    const chop = ctx.createGain(); chop.gain.value = 0.5;
+    const lfo = ctx.createOscillator(); lfo.frequency.value = 13;
+    const lfoAmt = ctx.createGain(); lfoAmt.gain.value = 0.5;
+    lfo.connect(lfoAmt).connect(chop.gain);
+    const whine = ctx.createOscillator(); whine.type = 'sawtooth'; whine.frequency.value = 180;
+    const wf = ctx.createBiquadFilter(); wf.type = 'lowpass'; wf.frequency.value = 900;
+    const wg = ctx.createGain(); wg.gain.value = 0.08;
+    const g = ctx.createGain(); g.gain.value = 0;
+    const pan = ctx.createStereoPanner();
+    src.connect(bp).connect(chop).connect(g);
+    whine.connect(wf).connect(wg).connect(g);
+    g.connect(pan).connect(master);
+    src.start(); lfo.start(); whine.start();
+    heli = { g, pan, bp };
+  }
+  function heliSound(vol, pan, bright) {
+    const ct = ctx.currentTime;
+    heli.g.gain.setTargetAtTime(vol, ct, 0.05);
+    heli.pan.pan.setTargetAtTime(pan, ct, 0.05);
+    heli.bp.frequency.setTargetAtTime(bright, ct, 0.05);
+  }
+
+  // ---------- Game ----------
+  let state = 'idle', t, deaths, phase, pos, rung, building, guns, ladderTimer;
+  let air, airT, copter, bombs, bombTimer, rideT, heldDir = 0, holdTimer = null, lastFrame, warned;
+
+  function resetRun() {
+    phase = 'hall'; pos = 0; rung = 0; building = 1; air = false; bombs = []; ladderTimer = 0.3;
+    guns = GUN_SPOTS.map(x => ({ x, mode: 'idle', timer: 1 + Math.random() * 2.5 }));
+    copter = { x: -5, dir: 1, speed: 4, wait: 0 };
+  }
+
+  function start() {
+    initAudio();
+    t = 0; deaths = 0; warned = {};
+    resetRun(); stopHold();
+    state = 'running'; lastFrame = performance.now();
+    h('hStatus').textContent = 'Running';
+    say('Go');
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  function die(how) {
+    deaths++; stopHold();
+    sfx.die();
+    heliSound(0, 0, 600);
+    resetRun();
+    say(`${how} Back to the start.`);
+    h('hStatus').textContent = 'Running';
+  }
+
+  function finish(won) {
+    state = 'over'; stopHold(); heliSound(0, 0, 600);
+    let msg;
+    if (won) {
+      sfx.win();
+      const nb = best === null || t < best;
+      if (nb) { best = t; try { localStorage.setItem('rooftopRunBest', String(t)); } catch (e) {} showBest(); }
+      msg = `You made it to the fourth building in ${t.toFixed(1)} seconds with ${deaths} death${deaths === 1 ? '' : 's'}.${nb ? ' New best!' : ''} Enter to play again.`;
+      h('hStatus').textContent = 'You made it';
+    } else {
+      sfx.timeout();
+      msg = `Time's up. You reached building ${building}. Enter to try again.`;
+      h('hStatus').textContent = "Time's up";
+    }
+    setTimeout(() => say(msg), 500);
+  }
+
+  function walk(dir) {
+    if (state !== 'running') return;
+    if (phase === 'hall') {
+      const np = pos + dir;
+      if (np < 0 || np > HALL) { sfx.bump(); return; }
+      pos = np; sfx.step();
+      if (pos === HALL) sfx.ladderHere();
+    } else if (phase === 'roof') {
+      if (air) return;
+      const np = pos + dir;
+      if (np < 0 || np > ROOF) { sfx.bump(); return; }
+      pos = np; sfx.roofStep();
+    } else if (phase === 'ladder') sfx.bump();
+    render();
+  }
+
+  function climb(dir) {
+    if (state !== 'running') return;
+    if (phase === 'hall' && dir > 0) {
+      if (pos !== HALL) { sfx.bump(); return; }
+      phase = 'ladder'; rung = 1; sfx.rung();
+    } else if (phase === 'ladder') {
+      rung += dir;
+      if (rung <= 0) { phase = 'hall'; rung = 0; sfx.step(); }
+      else if (rung >= 3) {
+        phase = 'roof'; pos = 2; rung = 0; sfx.rung(); sfx.roofStep();
+        bombTimer = 3 + Math.random() * 2;
+        say('Roof');
+      } else sfx.rung();
+    } else sfx.bump();
+    render();
+  }
+
+  function jump() {
+    if (state !== 'running' || phase !== 'roof' || air) return;
+    air = true; airT = JUMP_TIME; sfx.jump();
+  }
+  function grab() {
+    if (state !== 'running' || phase !== 'roof' || !air) return;
+    if (Math.abs(copter.x - pos) <= GRAB_RANGE) {
+      sfx.grab(); air = false; phase = 'ride'; rideT = RIDE_TIME; bombs = [];
+    }
+  }
+
+  function frame(now) {
+    if (state !== 'running') return;
+    const dt = Math.min(0.05, (now - lastFrame) / 1000); lastFrame = now;
+    t += dt;
+    if (phase === 'hall' || phase === 'ladder') updateHall(dt);
+    else if (phase === 'roof') updateRoof(dt);
+    else if (phase === 'ride') updateRide(dt);
+    if (state !== 'running') return;
+    const left = GAME_TIME - t;
+    if (left <= 30 && !warned[30]) { warned[30] = 1; say('30 seconds'); }
+    if (left <= 10 && !warned[10]) { warned[10] = 1; say('10 seconds'); }
+    if (left <= 0) { render(); finish(false); return; }
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  function updateHall(dt) {
+    const px = phase === 'ladder' ? HALL : pos;
+    ladderTimer -= dt;
+    if (ladderTimer <= 0 && phase === 'hall') { sfx.ladderPing(HALL - px); ladderTimer = 1.1; }
+    for (const g of guns) {
+      g.timer -= dt;
+      if (g.timer > 0) continue;
+      if (g.mode === 'idle') { g.mode = 'warn'; g.timer = 1.0; sfx.gunWarn(g.x - px); }
+      else {
+        sfx.bang(g.x - px);
+        g.mode = 'idle'; g.timer = 1.5 + Math.random() * 2.5;
+        if (phase === 'hall' && pos === g.x) { die('You were shot.'); return; }
+      }
+    }
+  }
+
+  function updateRoof(dt) {
+    // Helicopter back and forth
+    const c = copter;
+    if (c.wait > 0) { c.wait -= dt; if (c.wait <= 0) { c.dir = -c.dir; c.speed = 3.5 + Math.random() * 2.5; } }
+    else {
+      c.x += c.dir * c.speed * dt;
+      if ((c.dir > 0 && c.x > ROOF + 5) || (c.dir < 0 && c.x < -5)) c.wait = 0.5 + Math.random() * 1.5;
+    }
+    const dx = c.x - pos;
+    const close = Math.max(0, 1 - Math.abs(dx) / 10);
+    heliSound(0.05 + 0.45 * close * close, clampPan(dx), 400 + 2600 * close * close);
+    // Jump
+    if (air) { airT -= dt; if (airT <= 0) { air = false; sfx.land(); } }
+    // Bombs
+    bombTimer -= dt;
+    if (bombTimer <= 0) {
+      const target = Math.max(0, Math.min(ROOF, pos + Math.round(Math.random() * 6 - 3)));
+      const fall = 1.6;
+      bombs.push({ x: target, timer: fall });
+      sfx.whistle(target - pos, fall);
+      bombTimer = 3 + Math.random() * 3;
+    }
+    for (const b of bombs) {
+      b.timer -= dt;
+      if (b.timer <= 0) {
+        sfx.boom(b.x - pos);
+        if (Math.abs(b.x - pos) <= BLAST_RADIUS) { bombs = []; die('A bomb got you.'); return; }
+      }
+    }
+    bombs = bombs.filter(b => b.timer > 0);
+  }
+
+  function updateRide(dt) {
+    rideT -= dt;
+    heliSound(0.55, 0, 3000);
+    if (rideT <= 0) {
+      building++;
+      if (building >= 4) { sfx.land(); finish(true); return; }
+      phase = 'roof'; air = false; sfx.land(); sfx.arrive();
+      pos = Math.max(0, Math.min(ROOF, Math.round(copter.x)));
+      copter = { x: copter.dir > 0 ? ROOF + 5 : -5, dir: copter.dir, speed: 4, wait: 1 + Math.random() };
+      bombTimer = 2.5 + Math.random() * 2;
+      say(`Building ${building}`);
+    }
+  }
+
+  function whereText() {
+    if (phase === 'hall') return pos === HALL ? 'Building 1, at the ladder' : `Building 1 hallway, step ${pos} of ${HALL}`;
+    if (phase === 'ladder') return `On the ladder, rung ${rung} of 3`;
+    if (phase === 'ride') return 'On the helicopter';
+    return `Building ${building} roof, step ${pos} of ${ROOF}`;
+  }
+  function render() {
+    h('hWhere').textContent = whereText();
+    h('hTime').textContent = Math.max(0, Math.ceil(GAME_TIME - t));
+    h('hDeaths').textContent = deaths;
+    let map = '';
+    if (phase === 'hall' || phase === 'ladder') {
+      const row = Array(HALL + 1).fill('.');
+      for (const g of guns) row[g.x] = g.mode === 'warn' ? '!' : 'G';
+      row[HALL] = 'H';
+      if (phase === 'hall') row[pos] = '@';
+      map = 'Hallway: ' + row.join('') + (phase === 'ladder' ? `  (ladder rung ${rung})` : '');
+    } else if (phase === 'roof') {
+      const sky = Array(ROOF + 1).fill(' ');
+      const ci = Math.round(copter.x); if (ci >= 0 && ci <= ROOF) sky[ci] = 'X';
+      const row = Array(ROOF + 1).fill('_');
+      for (const b of bombs) row[b.x] = '*';
+      row[pos] = air ? '^' : '@';
+      map = 'Sky:  ' + sky.join('') + '\nRoof: ' + row.join('');
+    } else map = 'Riding the helicopter...';
+    h('map').textContent = map;
+  }
+
+  // ---------- Input ----------
+  function stopHold() { heldDir = 0; if (holdTimer) { clearInterval(holdTimer); holdTimer = null; } }
+  game.addEventListener('keydown', e => {
+    const k = e.key;
+    if (k === 'ArrowLeft' || k === 'ArrowRight') {
+      e.preventDefault();
+      if (e.repeat || state !== 'running') return;
+      const dir = k === 'ArrowRight' ? 1 : -1;
+      stopHold(); heldDir = dir; walk(dir);
+      holdTimer = setInterval(() => { if (heldDir) walk(heldDir); }, STEP_MS);
+      return;
+    }
+    if (k === 'Enter') { e.preventDefault(); if (state !== 'running') start(); return; }
+    if (state !== 'running') { if (k === ' ') e.preventDefault(); return; }
+    if (k === 'ArrowUp') { e.preventDefault(); if (!e.repeat) climb(1); }
+    else if (k === 'ArrowDown') { e.preventDefault(); if (!e.repeat) climb(-1); }
+    else if (k === ' ') { e.preventDefault(); if (!e.repeat) jump(); }
+    else if (k === 'f' || k === 'F') { e.preventDefault(); if (!e.repeat) grab(); }
+    else if (k === 'p' || k === 'P') { e.preventDefault(); say(whereText()); }
+    else if (k === 't' || k === 'T') { e.preventDefault(); say(Math.max(0, Math.ceil(GAME_TIME - t)) + ' seconds'); }
+  });
+  game.addEventListener('keyup', e => {
+    if ((e.key === 'ArrowRight' && heldDir === 1) || (e.key === 'ArrowLeft' && heldDir === -1)) stopHold();
+  });
+  game.addEventListener('blur', stopHold);
+  game.addEventListener('click', () => game.focus());
+  window.addEventListener('load', () => game.focus());
+})();
+</script>
+</body>
+</html>
