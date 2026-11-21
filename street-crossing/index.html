@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Street Crossing</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee; margin:0; padding:1.5rem; line-height:1.5; }
+  main { max-width: 40rem; margin: 0 auto; }
+  #game { border:2px solid #555; border-radius:8px; padding:1rem; margin:1rem 0; outline:none; }
+  #game:focus { border-color:#6cf; }
+  .row { display:flex; justify-content:space-between; font-size:1.2rem; padding:.2rem 0; }
+  #road { font-family: monospace; font-size:1.1rem; white-space:pre; margin-top:.5rem; }
+  .sr { position:absolute; left:-9999px; width:1px; height:1px; overflow:hidden; }
+  kbd { background:#333; border-radius:3px; padding:0 .3rem; }
+  a { color:#6cf; }
+</style>
+</head>
+<body>
+<main>
+<p><a href="../">Back to Audio Worlds</a></p>
+<h1>Street Crossing</h1>
+<div id="game" role="application" tabindex="0" aria-label="Street Crossing">
+  <div aria-hidden="true">
+    <div class="row"><span>Status</span><span id="hStatus">Press Enter to start</span></div>
+    <div class="row"><span>Where</span><span id="hWhere">Near side</span></div>
+    <div class="row"><span>Round trips</span><span id="hTrips">0 of 4</span></div>
+    <div class="row"><span>Time left</span><span id="hTime">30</span></div>
+    <div class="row"><span>Best</span><span id="hBest">-</span></div>
+    <div id="road"></div>
+  </div>
+</div>
+<div id="say" class="sr" aria-live="assertive" aria-atomic="true"></div>
+
+<h2>How to play</h2>
+<p>Cross to the far side and back four times in 30 seconds without getting hit. The road has two lanes on each side of a median. The curbs and the median are safe; the lanes are not.</p>
+<ul>
+  <li><kbd>Up arrow</kbd>: step toward the far side. <kbd>Down arrow</kbd>: step back toward the near side. Tap for one step, or hold to keep walking.</li>
+  <li>Three steps take you from a curb to the median, three more to the other curb.</li>
+  <li><kbd>P</kbd>: where you are. <kbd>T</kbd>: time left. <kbd>Enter</kbd>: start or restart.</li>
+</ul>
+<h2>Sounds</h2>
+<ul>
+  <li>Cars in the two near lanes drive from left to right. Cars in the two far lanes drive from right to left. You hear each car move across your speakers.</li>
+  <li>The closer a car's lane is to you, the louder it is. Each lane has its own engine pitch, with the lowest pitch nearest the near curb and the highest nearest the far curb.</li>
+  <li>Footsteps sound hard on the road and soft on the curbs and median. A chime plays when you reach the median, a bell at the far side, and a fanfare when you finish a round trip.</li>
+</ul>
+</main>
+
+<script>
+(() => {
+  const GAME_TIME = 30, TRIPS_NEEDED = 4, STEP_MS = 240;
+  // Positions 0..6. 0 near curb, 3 median, 6 far curb. Lanes at 1,2 (left to right) and 4,5 (right to left).
+  const LANES = { 1: { dir: 1, freq: 70 }, 2: { dir: 1, freq: 95 }, 4: { dir: -1, freq: 125 }, 5: { dir: -1, freq: 160 } };
+  const SAFE = new Set([0, 3, 6]);
+  const HIT_WIDTH = 0.09;
+
+  const game = document.getElementById('game');
+  const sayEl = document.getElementById('say');
+  const h = id => document.getElementById(id);
+  let flip = false;
+  const say = t => { flip = !flip; sayEl.textContent = t + (flip ? ' ' : ''); };
+
+  let best = null;
+  try { const b = localStorage.getItem('streetCrossingBest'); if (b) best = +b; } catch (e) {}
+  const showBest = () => h('hBest').textContent = best ? best.toFixed(1) + ' s' : '-';
+  showBest();
+
+  // ---------- Audio ----------
+  let ctx, master, noiseBuf;
+  function initAudio() {
+    if (ctx) { if (ctx.state === 'suspended') ctx.resume(); return; }
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    master = ctx.createGain(); master.gain.value = 0.8; master.connect(ctx.destination);
+    noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  function tone(freq, type, dur, vol, delay = 0, endFreq = null) {
+    const t = ctx.currentTime + delay;
+    const o = ctx.createOscillator(); o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (endFreq) o.frequency.exponentialRampToValueAtTime(endFreq, t + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(master); o.start(t); o.stop(t + dur + 0.05);
+  }
+  function noise(dur, vol, type, freq, q = 1, delay = 0) {
+    const t = ctx.currentTime + delay;
+    const s = ctx.createBufferSource(); s.buffer = noiseBuf;
+    const f = ctx.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
+    const g = ctx.createGain(); g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f).connect(g).connect(master); s.start(t); s.stop(t + dur + 0.05);
+  }
+  const sfx = {
+    stepRoad() { noise(0.06, 0.35, 'highpass', 1800, 1); },
+    stepSafe() { noise(0.09, 0.3, 'lowpass', 500, 1); },
+    bump() { tone(120, 'sine', 0.1, 0.2); },
+    median() { tone(784, 'sine', 0.15, 0.2); tone(1047, 'sine', 0.2, 0.2, 0.12); },
+    far() { tone(1319, 'sine', 0.7, 0.25); tone(2637, 'sine', 0.4, 0.06); },
+    trip() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 'triangle', 0.18, 0.2, i * 0.1)); },
+    crash() {
+      tone(1200, 'sawtooth', 0.4, 0.15, 0, 400);
+      noise(1.2, 0.9, 'lowpass', 1200, 1, 0.1);
+      tone(70, 'sine', 0.8, 0.7, 0.1, 35);
+    },
+    win() { [523, 659, 784, 659, 784, 1047].forEach((f, i) => tone(f, 'triangle', 0.22, 0.22, i * 0.13)); },
+    timeout() { tone(392, 'square', 0.3, 0.12); tone(330, 'square', 0.3, 0.12, 0.3); tone(262, 'square', 0.6, 0.12, 0.6); }
+  };
+
+  // Car: noise + low saw through filters, panned by position
+  function makeCar(lane) {
+    const L = LANES[lane];
+    const speed = 0.7 + Math.random() * 0.5; // screen widths per second
+    const car = { lane, dir: L.dir, x: L.dir > 0 ? -1.3 : 1.3, speed, nodes: null };
+    const src = ctx.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+    const bf = ctx.createBiquadFilter(); bf.type = 'bandpass'; bf.frequency.value = L.freq * 6; bf.Q.value = 2;
+    const osc = ctx.createOscillator(); osc.type = 'sawtooth'; osc.frequency.value = L.freq;
+    const of = ctx.createBiquadFilter(); of.type = 'lowpass'; of.frequency.value = L.freq * 5;
+    const og = ctx.createGain(); og.gain.value = 0.6;
+    const g = ctx.createGain(); g.gain.value = 0;
+    const pan = ctx.createStereoPanner();
+    src.connect(bf).connect(g);
+    osc.connect(of).connect(og).connect(g);
+    g.connect(pan).connect(master);
+    src.start(); osc.start();
+    car.nodes = { src, osc, g, pan, base: L.freq };
+    return car;
+  }
+  function killCar(c, fast) {
+    const n = c.nodes; if (!n) return;
+    const t = ctx.currentTime;
+    n.g.gain.setTargetAtTime(0, t, fast ? 0.02 : 0.1);
+    n.src.stop(t + 0.5); n.osc.stop(t + 0.5);
+    c.nodes = null;
+  }
+
+  // ---------- Game ----------
+  let state = 'idle', t, pos, trips, reachedFar, cars, spawnTimers, heldDir, holdTimer, lastFrame, warned;
+
+  function start() {
+    initAudio();
+    if (cars) cars.forEach(c => killCar(c, true));
+    t = 0; pos = 0; trips = 0; reachedFar = false; cars = []; warned = false;
+    spawnTimers = {}; for (const l in LANES) spawnTimers[l] = Math.random() * 1.5;
+    stopHold();
+    state = 'running'; lastFrame = performance.now();
+    h('hStatus').textContent = 'Running';
+    say('Go');
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  function finish(kind) {
+    state = 'over'; stopHold();
+    cars.forEach(c => killCar(c, kind !== 'hit'));
+    let msg;
+    if (kind === 'win') {
+      sfx.win();
+      const time = t;
+      const nb = best === null || time < best;
+      if (nb) { best = time; try { localStorage.setItem('streetCrossingBest', String(best)); } catch (e) {} showBest(); }
+      msg = `You made it! Four round trips in ${time.toFixed(1)} seconds.${nb ? ' New best!' : ''} Enter to play again.`;
+      h('hStatus').textContent = 'You made it';
+    } else if (kind === 'hit') {
+      sfx.crash();
+      msg = `You got hit. Game over after ${trips} round trip${trips === 1 ? '' : 's'}. Enter to try again.`;
+      h('hStatus').textContent = 'Hit by a car';
+    } else {
+      sfx.timeout();
+      msg = `Time's up. ${trips} of 4 round trips. Enter to try again.`;
+      h('hStatus').textContent = "Time's up";
+    }
+    setTimeout(() => say(msg), kind === 'hit' ? 1300 : 600);
+  }
+
+  function step(dir) {
+    if (state !== 'running') return;
+    const np = pos + dir;
+    if (np < 0 || np > 6) { sfx.bump(); return; }
+    pos = np;
+    if (SAFE.has(pos)) sfx.stepSafe(); else sfx.stepRoad();
+    if (pos === 3) sfx.median();
+    if (pos === 6 && !reachedFar) { reachedFar = true; sfx.far(); }
+    if (pos === 0 && reachedFar) {
+      reachedFar = false; trips++;
+      if (trips >= TRIPS_NEEDED) { render(); finish('win'); return; }
+      sfx.trip(); say(`${trips} of 4`);
+    }
+    checkHit();
+    render();
+  }
+
+  function checkHit() {
+    if (state !== 'running' || SAFE.has(pos)) return;
+    for (const c of cars) if (c.lane === pos && Math.abs(c.x) < HIT_WIDTH) { render(); finish('hit'); return; }
+  }
+
+  function frame(now) {
+    if (state !== 'running') return;
+    const dt = Math.min(0.05, (now - lastFrame) / 1000); lastFrame = now;
+    t += dt;
+    // Spawn
+    for (const l in LANES) {
+      spawnTimers[l] -= dt;
+      if (spawnTimers[l] <= 0) { cars.push(makeCar(+l)); spawnTimers[l] = 1.3 + Math.random() * 1.8; }
+    }
+    // Move cars and update sound
+    const ct = ctx.currentTime;
+    for (const c of cars) {
+      c.x += c.dir * c.speed * dt;
+      if (!c.nodes) continue;
+      const laneDist = Math.abs(c.lane - pos);
+      const near = 1 / (1 + laneDist * 0.9);
+      const edge = Math.max(0, 1 - Math.abs(c.x) / 1.3);
+      c.nodes.g.gain.setTargetAtTime(0.35 * near * edge * edge, ct, 0.03);
+      c.nodes.pan.pan.setTargetAtTime(Math.max(-1, Math.min(1, c.x)), ct, 0.03);
+      const approaching = c.x * c.dir < 0;
+      c.nodes.osc.frequency.setTargetAtTime(c.nodes.base * (approaching ? 1.08 : 0.93), ct, 0.05);
+    }
+    for (const c of cars) if (Math.abs(c.x) > 1.3) killCar(c);
+    cars = cars.filter(c => Math.abs(c.x) <= 1.3);
+    checkHit();
+    if (state !== 'running') return;
+    const left = GAME_TIME - t;
+    if (left <= 10 && !warned) { warned = true; say('10 seconds'); }
+    if (left <= 0) { render(); finish('time'); return; }
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  function whereText() {
+    if (pos === 0) return 'Near side';
+    if (pos === 6) return 'Far side';
+    if (pos === 3) return 'Median';
+    if (pos < 3) return `Near lanes, step ${pos} of 2`;
+    return `Far lanes, step ${pos - 3} of 2`;
+  }
+  function render() {
+    h('hWhere').textContent = whereText();
+    h('hTrips').textContent = `${trips} of 4`;
+    h('hTime').textContent = Math.max(0, Math.ceil(GAME_TIME - t));
+    const cells = ['curb ', 'lane1', 'lane2', 'MEDIAN', 'lane3', 'lane4', 'curb '];
+    const lines = [];
+    for (let p = 6; p >= 0; p--) {
+      let line = (p === pos ? '> ' : '  ') + cells[p].padEnd(7);
+      if (LANES[p]) {
+        const row = Array(21).fill('-');
+        for (const c of cars) if (c.lane === p) { const i = Math.round((c.x + 1) * 10); if (i >= 0 && i < 21) row[i] = '#'; }
+        row[10] = p === pos ? '@' : (row[10] === '#' ? '#' : '|');
+        line += row.join('');
+      }
+      lines.push(line);
+    }
+    h('road').textContent = lines.join('\n');
+  }
+
+  // ---------- Input: tap = one step, hold = repeat ----------
+  function stopHold() { heldDir = 0; if (holdTimer) { clearInterval(holdTimer); holdTimer = null; } }
+  game.addEventListener('keydown', e => {
+    const k = e.key;
+    if (k === 'ArrowUp' || k === 'ArrowDown') {
+      e.preventDefault();
+      if (e.repeat || state !== 'running') return;
+      const dir = k === 'ArrowUp' ? 1 : -1;
+      stopHold();
+      heldDir = dir;
+      step(dir);
+      holdTimer = setInterval(() => { if (heldDir) step(heldDir); }, STEP_MS);
+      return;
+    }
+    if (k === 'Enter' || k === ' ') { e.preventDefault(); if (state !== 'running') start(); return; }
+    if (state !== 'running') return;
+    if (k === 'p' || k === 'P') { e.preventDefault(); say(whereText()); }
+    else if (k === 't' || k === 'T') { e.preventDefault(); say(Math.max(0, Math.ceil(GAME_TIME - t)) + ' seconds'); }
+  });
+  game.addEventListener('keyup', e => {
+    if ((e.key === 'ArrowUp' && heldDir === 1) || (e.key === 'ArrowDown' && heldDir === -1)) stopHold();
+  });
+  game.addEventListener('blur', stopHold);
+  game.addEventListener('click', () => game.focus());
+  window.addEventListener('load', () => game.focus());
+})();
+</script>
+</body>
+</html>
