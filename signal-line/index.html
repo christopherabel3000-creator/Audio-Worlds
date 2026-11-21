@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signal Line</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee; margin:0; padding:1.5rem; line-height:1.5; }
+  main { max-width: 40rem; margin: 0 auto; }
+  #game { border:2px solid #555; border-radius:8px; padding:1rem; margin:1rem 0; outline:none; }
+  #game:focus { border-color:#6cf; }
+  .row { display:flex; justify-content:space-between; font-size:1.2rem; padding:.2rem 0; }
+  #lamp { display:inline-block; width:1.2rem; height:1.2rem; border-radius:50%; background:#333; vertical-align:middle; margin-right:.4rem; }
+  .sr { position:absolute; left:-9999px; width:1px; height:1px; overflow:hidden; }
+  kbd { background:#333; border-radius:3px; padding:0 .3rem; }
+</style>
+</head>
+<body>
+<main>
+<h1>Signal Line</h1>
+<div id="game" role="application" tabindex="0" aria-label="Signal Line">
+  <div aria-hidden="true">
+    <div class="row"><span>Status</span><span id="hStatus">Press Enter to start</span></div>
+    <div class="row"><span>Speed</span><span id="hSpeed">0 mph</span></div>
+    <div class="row"><span>Throttle</span><span id="hThrottle">Coast</span></div>
+    <div class="row"><span>Next signal</span><span><span id="lamp"></span><span id="hSignal">-</span></span></div>
+    <div class="row"><span>Time left</span><span id="hTime">90</span></div>
+    <div class="row"><span>Signals cleared</span><span id="hCleared">0</span></div>
+    <div class="row"><span>Best</span><span id="hBest">-</span></div>
+  </div>
+</div>
+<div id="say" class="sr" aria-live="assertive" aria-atomic="true"></div>
+
+<h2>How to play</h2>
+<p>Drive your train for 90 seconds and go as far as you can. Never pass a signal while it's red.</p>
+<ul>
+  <li><kbd>Up arrow</kbd>: more power (two steps to full power)</li>
+  <li><kbd>Down arrow</kbd>: less power, then brake (two steps of brake below coast)</li>
+  <li><kbd>S</kbd>: speed. <kbd>D</kbd>: distance and color of the next signal. <kbd>T</kbd>: time left.</li>
+  <li><kbd>Enter</kbd>: start or restart</li>
+</ul>
+<h2>Sounds</h2>
+<ul>
+  <li>The next signal sends a beacon that gets louder and faster as you get closer. High ping means green, double beep means yellow, low buzz means red.</li>
+  <li>When the next signal changes color you hear a short chime: rising for green, two even notes for yellow, falling for red.</li>
+  <li>A bell rings each time you clear a signal.</li>
+  <li>The engine and wheel clacks speed up as you go faster. Brakes squeal while braking.</li>
+</ul>
+<p>Yellow lasts about 4 seconds, and at full speed the train needs about 6 seconds to stop on full brake. Listen ahead!</p>
+</main>
+
+<script>
+(() => {
+  // ---------- Tuning ----------
+  const GAME_TIME = 90;          // seconds
+  const MAX_V = 25;              // m/s (about 56 mph)
+  const ACCEL = [-4, -2, -0.15, 0.8, 1.6]; // index = level + 2
+  const LEVEL_NAMES = ['Full brake', 'Brake', 'Coast', 'Power', 'Full power'];
+  const BEACON_RANGE = 450;      // meters
+  const RAIL_LEN = 18;           // meters between wheel clacks
+  const M_TO_FT = 3.28084, MPS_TO_MPH = 2.23694;
+
+  // ---------- Elements ----------
+  const game = document.getElementById('game');
+  const sayEl = document.getElementById('say');
+  const h = id => document.getElementById(id);
+  let sayToggle = false;
+  function say(text) {
+    // Alternate a trailing invisible character so repeated text is still announced
+    sayToggle = !sayToggle;
+    sayEl.textContent = text + (sayToggle ? ' ' : '');
+  }
+
+  let best = null;
+  try { const b = localStorage.getItem('signalLineBest'); if (b) best = JSON.parse(b); } catch (e) {}
+  function showBest() { h('hBest').textContent = best ? `${best.signals} signals, ${best.miles} mi` : '-'; }
+  showBest();
+
+  // ---------- Audio ----------
+  let ctx = null, master, noiseBuf;
+  let engGain, engFilter, motorOsc, motorGain, brakeGain;
+
+  function initAudio() {
+    if (ctx) { if (ctx.state === 'suspended') ctx.resume(); return; }
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    master = ctx.createGain(); master.gain.value = 0.8; master.connect(ctx.destination);
+    noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+
+    // Engine rumble
+    const n1 = loopNoise();
+    engFilter = ctx.createBiquadFilter(); engFilter.type = 'lowpass'; engFilter.frequency.value = 150;
+    engGain = ctx.createGain(); engGain.gain.value = 0;
+    n1.connect(engFilter).connect(engGain).connect(master);
+    // Motor hum
+    motorOsc = ctx.createOscillator(); motorOsc.type = 'sawtooth'; motorOsc.frequency.value = 45;
+    const mf = ctx.createBiquadFilter(); mf.type = 'lowpass'; mf.frequency.value = 350;
+    motorGain = ctx.createGain(); motorGain.gain.value = 0;
+    motorOsc.connect(mf).connect(motorGain).connect(master); motorOsc.start();
+    // Brake squeal
+    const n2 = loopNoise();
+    const bf = ctx.createBiquadFilter(); bf.type = 'bandpass'; bf.frequency.value = 2800; bf.Q.value = 10;
+    brakeGain = ctx.createGain(); brakeGain.gain.value = 0;
+    n2.connect(bf).connect(brakeGain).connect(master);
+  }
+  function loopNoise() { const s = ctx.createBufferSource(); s.buffer = noiseBuf; s.loop = true; s.start(); return s; }
+
+  function tone(freq, type, dur, vol, delay = 0, endFreq = null, filterFreq = null) {
+    const t = ctx.currentTime + delay;
+    const o = ctx.createOscillator(); o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (endFreq) o.frequency.exponentialRampToValueAtTime(endFreq, t + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    let node = o;
+    if (filterFreq) { const f = ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = filterFreq; o.connect(f); node = f; }
+    node.connect(g).connect(master);
+    o.start(t); o.stop(t + dur + 0.05);
+  }
+  function noiseBurst(dur, vol, type, freq, q = 1, delay = 0) {
+    const t = ctx.currentTime + delay;
+    const s = ctx.createBufferSource(); s.buffer = noiseBuf;
+    const f = ctx.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f).connect(g).connect(master); s.start(t); s.stop(t + dur + 0.05);
+  }
+
+  const sfx = {
+    beacon(color, vol) {
+      if (color === 'green') tone(880, 'sine', 0.12, vol);
+      else if (color === 'yellow') { tone(660, 'triangle', 0.07, vol); tone(660, 'triangle', 0.07, vol, 0.1); }
+      else tone(180, 'square', 0.2, vol * 0.8, 0, null, 900);
+    },
+    change(color, vol) {
+      if (color === 'green') { tone(660, 'sine', 0.15, vol); tone(990, 'sine', 0.2, vol, 0.15); }
+      else if (color === 'yellow') { tone(740, 'triangle', 0.15, vol); tone(740, 'triangle', 0.15, vol, 0.18); }
+      else { tone(440, 'square', 0.18, vol * 0.7, 0, null, 1200); tone(262, 'square', 0.3, vol * 0.7, 0.18, null, 1200); }
+    },
+    clack(speed) {
+      const v = 0.05 + speed / MAX_V * 0.12;
+      noiseBurst(0.04, v, 'bandpass', 1400, 2);
+      noiseBurst(0.04, v * 0.8, 'bandpass', 1200, 2, 0.07);
+    },
+    notch(level) { tone(400 + level * 100, 'square', 0.04, 0.08, 0, null, 2000); },
+    bell() { tone(1320, 'sine', 0.8, 0.25); tone(2640, 'sine', 0.5, 0.08); },
+    crash() {
+      tone(311, 'sawtooth', 0.6, 0.2, 0, null, 1500); tone(370, 'sawtooth', 0.6, 0.2, 0, null, 1500);
+      noiseBurst(1.8, 0.9, 'lowpass', 900, 1, 0.5);
+      tone(60, 'sine', 1.2, 0.8, 0.5, 30);
+    },
+    whistle() { tone(466, 'sawtooth', 1.2, 0.15, 0, null, 2000); tone(587, 'sawtooth', 1.2, 0.15, 0, null, 2000); }
+  };
+
+  // ---------- Game state ----------
+  let state = 'idle'; // idle | running | over
+  let t, x, v, level, signals, nextIdx, cleared, nextJoint, beaconTimer, lastFrame, warned;
+
+  function randRange(a, b) { return a + Math.random() * (b - a); }
+  function durationFor(color) {
+    if (color === 'green') return randRange(5, 8);
+    if (color === 'yellow') return randRange(3.5, 4.5);
+    return randRange(4, 6.5);
+  }
+  const NEXT = { green: 'yellow', yellow: 'red', red: 'green' };
+
+  function makeSignals() {
+    const list = [];
+    let pos = 250;
+    while (pos < 4000) {
+      const r = Math.random();
+      const color = r < 0.45 ? 'green' : r < 0.6 ? 'yellow' : 'red';
+      list.push({ x: pos, color, timer: Math.random() * durationFor(color) });
+      pos += randRange(220, 380);
+    }
+    return list;
+  }
+
+  function start() {
+    initAudio();
+    t = 0; x = 0; v = 0; level = 0; cleared = 0; nextJoint = RAIL_LEN; beaconTimer = 0.5;
+    signals = makeSignals(); nextIdx = 0; warned = {};
+    state = 'running';
+    lastFrame = performance.now();
+    h('hStatus').textContent = 'Running';
+    say('Go');
+    requestAnimationFrame(frame);
+  }
+
+  function end(won) {
+    state = 'over';
+    const miles = (x / 1609.34).toFixed(2);
+    engGain.gain.setTargetAtTime(0, ctx.currentTime, 0.3);
+    motorGain.gain.setTargetAtTime(0, ctx.currentTime, 0.3);
+    brakeGain.gain.setTargetAtTime(0, ctx.currentTime, 0.1);
+    let msg;
+    if (won) {
+      sfx.whistle();
+      let newBest = !best || cleared > best.signals || (cleared === best.signals && +miles > +best.miles);
+      if (newBest) { best = { signals: cleared, miles }; try { localStorage.setItem('signalLineBest', JSON.stringify(best)); } catch (e) {} showBest(); }
+      msg = `Shift complete. ${cleared} signals cleared, ${miles} miles.${newBest ? ' New best!' : ''} Enter to play again.`;
+      h('hStatus').textContent = 'Shift complete';
+    } else {
+      sfx.crash();
+      msg = `You ran a red signal. Game over. ${cleared} signals cleared, ${miles} miles. Enter to try again.`;
+      h('hStatus').textContent = 'Ran a red signal';
+    }
+    setTimeout(() => say(msg), won ? 300 : 1500);
+  }
+
+  function frame(now) {
+    if (state !== 'running') return;
+    const dt = Math.min(0.05, (now - lastFrame) / 1000);
+    lastFrame = now;
+    update(dt);
+    if (state === 'running') requestAnimationFrame(frame);
+  }
+
+  function update(dt) {
+    t += dt;
+    // Signals
+    for (let i = nextIdx; i < signals.length && signals[i].x < x + 1500; i++) {
+      const s = signals[i];
+      s.timer -= dt;
+      if (s.timer <= 0) {
+        s.color = NEXT[s.color];
+        s.timer = durationFor(s.color);
+        if (i === nextIdx) {
+          const dist = s.x - x;
+          if (dist < BEACON_RANGE * 1.3) sfx.change(s.color, 0.12 + 0.18 * (1 - Math.min(1, dist / (BEACON_RANGE * 1.3))));
+          beaconTimer = 0.6;
+        }
+      }
+    }
+    // Physics
+    v = Math.max(0, Math.min(MAX_V, v + ACCEL[level + 2] * dt));
+    const prevX = x;
+    x += v * dt;
+    // Crossing a signal
+    const s = signals[nextIdx];
+    if (s && prevX < s.x && x >= s.x) {
+      if (s.color === 'red') { render(); end(false); return; }
+      cleared++; nextIdx++; sfx.bell(); beaconTimer = 0.8;
+    }
+    // Wheels
+    while (x >= nextJoint) { sfx.clack(v); nextJoint += RAIL_LEN; }
+    // Beacon
+    const ns = signals[nextIdx];
+    beaconTimer -= dt;
+    if (ns && beaconTimer <= 0) {
+      const dist = ns.x - x;
+      if (dist < BEACON_RANGE) {
+        const k = dist / BEACON_RANGE;
+        sfx.beacon(ns.color, 0.05 + 0.15 * (1 - k));
+        beaconTimer = 0.25 + k * 1.0;
+      } else beaconTimer = 0.3;
+    }
+    // Continuous sounds
+    const sp = v / MAX_V, ct = ctx.currentTime;
+    engFilter.frequency.setTargetAtTime(150 + sp * 900, ct, 0.1);
+    engGain.gain.setTargetAtTime(0.03 + sp * 0.25 + (level > 0 ? level * 0.04 : 0), ct, 0.1);
+    motorOsc.frequency.setTargetAtTime(45 + sp * 90 + (level > 0 ? level * 10 : 0), ct, 0.1);
+    motorGain.gain.setTargetAtTime(0.04 + (level > 0 ? level * 0.03 : 0), ct, 0.1);
+    brakeGain.gain.setTargetAtTime(level < 0 && v > 0.5 ? (-level) * 0.05 * Math.min(1, sp * 3) : 0, ct, 0.05);
+    // Time warnings
+    const left = GAME_TIME - t;
+    if (left <= 30 && !warned[30]) { warned[30] = 1; say('30 seconds left'); }
+    if (left <= 10 && !warned[10]) { warned[10] = 1; say('10 seconds left'); }
+    render();
+    if (t >= GAME_TIME) end(true);
+  }
+
+  function render() {
+    h('hSpeed').textContent = Math.round(v * MPS_TO_MPH) + ' mph';
+    h('hThrottle').textContent = LEVEL_NAMES[level + 2];
+    h('hTime').textContent = Math.max(0, Math.ceil(GAME_TIME - t));
+    h('hCleared').textContent = cleared;
+    const ns = signals[nextIdx];
+    if (ns) {
+      h('hSignal').textContent = `${ns.color}, ${Math.round((ns.x - x) * M_TO_FT)} ft`;
+      h('lamp').style.background = { green: '#2c2', yellow: '#ec2', red: '#e22' }[ns.color];
+    }
+  }
+
+  // ---------- Input ----------
+  game.addEventListener('keydown', e => {
+    const k = e.key;
+    if (k === 'Enter' || k === ' ') {
+      e.preventDefault();
+      if (state !== 'running') start();
+      return;
+    }
+    if (state !== 'running') return;
+    if (k === 'ArrowUp' || k === 'ArrowDown') {
+      e.preventDefault();
+      const nl = Math.max(-2, Math.min(2, level + (k === 'ArrowUp' ? 1 : -1)));
+      if (nl !== level) { level = nl; sfx.notch(level); }
+      say(LEVEL_NAMES[level + 2]);
+    } else if (k === 's' || k === 'S') {
+      e.preventDefault(); say(Math.round(v * MPS_TO_MPH) + ' miles per hour');
+    } else if (k === 'd' || k === 'D') {
+      e.preventDefault();
+      const ns = signals[nextIdx];
+      say(ns ? `${ns.color}, ${Math.round((ns.x - x) * M_TO_FT)} feet` : 'No signal ahead');
+    } else if (k === 't' || k === 'T') {
+      e.preventDefault(); say(Math.max(0, Math.ceil(GAME_TIME - t)) + ' seconds left');
+    }
+  });
+  game.addEventListener('click', () => game.focus());
+  window.addEventListener('load', () => game.focus());
+})();
+</script>
+</body>
+</html>
